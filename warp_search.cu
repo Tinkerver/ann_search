@@ -142,7 +142,10 @@ void warp_independent_search_kernel(pq_idx_t* d_data,value_t* d_query,idx_t* d_r
 	__shared__ int finished[N_MULTIQUERY];
 	__shared__ idx_t index_list[N_MULTIQUERY][FIXED_DEGREE * N_MULTIPROBE];
 	__shared__ char index_list_len[N_MULTIQUERY];
-	extern __shared__ pq_value_t pq_table[N_MULTIQUERY][pq_dim][k];
+	// __shared__ pq_value_t pq_table[N_MULTIQUERY][pq_dim][k];
+	extern __shared__ pq_value_t dynamic_shared_memory[];
+	pq_value_t (*pq_table)[pq_dim][k] = (pq_value_t (*)[pq_dim][k])dynamic_shared_memory;
+	
 	value_t start_distance;
 	__syncthreads();
 
@@ -315,7 +318,8 @@ static void astar_multi_start_search_batch(const std::vector<std::vector<std::pa
 	cudaMemcpy(d_query,h_query.get(),sizeof(value_t) * queries.size() * dim,cudaMemcpyHostToDevice);
 
 
-	warp_independent_search_kernel<<<queries.size()/N_MULTIQUERY,32>>>(d_data,d_query,d_result,d_graph,d_pq_centroid,queries.size());
+	// warp_independent_search_kernel<<<queries.size()/N_MULTIQUERY,32>>>(d_data,d_query,d_result,d_graph,d_pq_centroid,queries.size());
+	warp_independent_search_kernel<<<queries.size()/N_MULTIQUERY,32,sizeof(pq_value_t) * N_MULTIQUERY * pq_dim * 256>>>(d_data,d_query,d_result,d_graph,d_pq_centroid,queries.size());
 
 	cudaMemcpy(h_result.get(),d_result,sizeof(idx_t) * queries.size() * TOPK,cudaMemcpyDeviceToHost);
 
