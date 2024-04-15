@@ -17,6 +17,9 @@
 #include<stdlib.h>
 #include<iostream>
 
+#include "lightbam.cuh"
+#include "gemm.cuh"
+
 #define pq_idx_t u_int8_t
 #define pq_value_t _Float32
 #define value_t u_int8_t
@@ -38,6 +41,9 @@ const int pq_dim = 128;
 const int num_queries = 100;
 const int degree = 100;
 const int k = 256;
+const int num_queues_per_ssd = 128;
+const int queue_depth = 128;
+const int max_io_size = 4096;
 
 #define TOPK 100
 
@@ -100,8 +106,30 @@ __device__ void computePQTable(
 	}
 }
 
+__device__ static void read_data(uint64_t start_lb, uint64_t num_lb, IoQueuePair *ssdqp, uint64_t *prp1)
+{
+    uint32_t cid;
+	// otherwise require cross-block synchronization
+	assert(blockIdx.x < num_queues_per_ssd);
+	assert(max_io_size <= AEOLUS_HOST_PGSIZE * 2);
+    int global_queue_id = blockIdx.x;
+    uint64_t global_pos = (uint64_t)global_queue_id * queue_depth;
+	uint64_t offset = global_pos * max_io_size;
+    uint64_t io_addr = prp1[offset / AEOLUS_DEVICE_PGSIZE] + offset % AEOLUS_DEVICE_PGSIZE;
+	offset += AEOLUS_HOST_PGSIZE;
+    uint64_t io_addr2 = prp1[offset / AEOLUS_DEVICE_PGSIZE] + offset % AEOLUS_DEVICE_PGSIZE;
+    ssdqp[global_queue_id].submit(cid, NVME_OPCODE_READ, io_addr, io_addr2, start_lb & 0xffffffff, (start_lb >> 32) & 0xffffffff, NVME_RW_LIMITED_RETRY_MASK | (num_lb - 1));
+    uint32_t status;
+    ssdqp[global_queue_id].poll(status, cid);
+    if (status != 0)
+    {
+        printf("read/write failed with status 0x%x\n", status);
+        assert(0);
+    }
+}
+
 __global__
-void warp_independent_search_kernel(pq_idx_t* d_data,value_t* d_query,idx_t* d_result,graph_node<dim,degree>* d_graph,pq_value_t* d_pq_centroid, int num_query){
+void warp_independent_search_kernel(pq_idx_t* d_data,value_t* d_query,idx_t* d_result,pq_value_t* d_pq_centroid, int num_query, IoQueuePair *ssdqp, uint64_t *prp1, void *iobuf){
 	const int QUEUE_SIZE = TOPK;
     int bid = blockIdx.x * N_MULTIQUERY;
 	const int step = N_THREAD_IN_WARP;
@@ -210,8 +238,11 @@ void warp_independent_search_kernel(pq_idx_t* d_data,value_t* d_query,idx_t* d_r
 					pop_heap(topk,topk + topk_heap_size);
 					--topk_heap_size;
 				}
+				int num_lbs = max_io_size / AEOLUS_LB_SIZE;
+				read_data(now.second*num_lbs,num_lbs,ssdqp,prp1);
+				graph_node<dim,degree> *now_node = (graph_node<dim,degree>*)(iobuf+1ll*blockIdx.x*queue_depth*max_io_size);
 				for(int i = 0;i < degree;++i){
-					auto idx = d_graph[now.second].indexes[i];
+					auto idx = now_node->indexes[i];
 					if(subtid == 0){
 						if(pbf->test(idx)){
 							continue;
@@ -293,13 +324,13 @@ static void astar_multi_start_search_batch(const std::vector<std::vector<std::pa
 	value_t* d_query;
 	idx_t* d_result;
 	pq_value_t* d_pq_centroid;
-	graph_node<dim,degree>* d_graph;
+	// graph_node<dim,degree>* d_graph;
 	
 	cudaMalloc(&d_data,sizeof(pq_idx_t*) * num * dim);
-	cudaMalloc(&d_graph,sizeof(graph_node<dim,degree>) * num);
+	// cudaMalloc(&d_graph,sizeof(graph_node<dim,degree>) * num);
 	cudaMalloc(&d_pq_centroid,sizeof(pq_value_t) * 256 * dim);
 	cudaMemcpy(d_data,h_data,sizeof(pq_idx_t*) * num * dim,cudaMemcpyHostToDevice);
-	cudaMemcpy(d_graph,h_graph,sizeof(graph_node<dim,degree>) * num,cudaMemcpyHostToDevice);
+	// cudaMemcpy(d_graph,h_graph,sizeof(graph_node<dim,degree>) * num,cudaMemcpyHostToDevice);
 	cudaMemcpy(d_pq_centroid,pq_centroid,sizeof(pq_value_t) * 256 * dim,cudaMemcpyHostToDevice);
 
 
@@ -317,9 +348,13 @@ static void astar_multi_start_search_batch(const std::vector<std::vector<std::pa
 	
 	cudaMemcpy(d_query,h_query.get(),sizeof(value_t) * queries.size() * dim,cudaMemcpyHostToDevice);
 
+	// init ssd controller
+	std::vector<Device *> devices{new Device(0)};
+	Controller *ctrl = new ControllerDecoupled(devices, num_queues_per_ssd, max_io_size, queue_depth, AEOLUS_DIST_STRIPE, AEOLUS_BUF_PINNED);
+	PinnedBuffer *buf = new PinnedBuffer(devices[0], 1ll * num_queues_per_ssd * queue_depth * max_io_size, max_io_size);
 
 	// warp_independent_search_kernel<<<queries.size()/N_MULTIQUERY,32>>>(d_data,d_query,d_result,d_graph,d_pq_centroid,queries.size());
-	warp_independent_search_kernel<<<queries.size()/N_MULTIQUERY,32,sizeof(pq_value_t) * N_MULTIQUERY * pq_dim * 256>>>(d_data,d_query,d_result,d_graph,d_pq_centroid,queries.size());
+	warp_independent_search_kernel<<<queries.size()/N_MULTIQUERY,32,sizeof(pq_value_t) * N_MULTIQUERY * pq_dim * 256>>>(d_data,d_query,d_result,d_pq_centroid,queries.size(), ctrl->get_io_queue_pair(), buf->get_d_prp_phys(), *buf);
 
 	cudaMemcpy(h_result.get(),d_result,sizeof(idx_t) * queries.size() * TOPK,cudaMemcpyDeviceToHost);
 
@@ -333,7 +368,7 @@ static void astar_multi_start_search_batch(const std::vector<std::vector<std::pa
 	cudaFree(d_data);
 	cudaFree(d_query);
 	cudaFree(d_result);
-	cudaFree(d_graph);
+	// cudaFree(d_graph);
 	cudaFree(d_pq_centroid);
 }
 
