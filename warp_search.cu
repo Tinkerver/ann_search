@@ -17,9 +17,13 @@
 #include<stdlib.h>
 #include<iostream>
 
-// #include"type_def.h"
-// #include"graph_node.h"
-#include"read_bin.h"
+#define pq_idx_t u_int8_t
+#define pq_value_t _Float32
+#define value_t u_int8_t
+#define idx_t u_int64_t
+#define size_t int
+#define pq_value_t _Float32
+#define dist_t _Float32
 
 #define FULL_MASK 0xffffffff
 #define N_THREAD_IN_WARP 32
@@ -28,17 +32,21 @@
 #define N_MULTIPROBE 1
 #define FINISH_CNT 1
 
-const int num_vertices = 1000000;
+const int num_vertices = 1000;
 const int dim = 128;
 const int pq_dim = 128;
 const int num_queries = 100;
-const int degree = 64;
+const int degree = 100;
 const int k = 256;
 
 #define TOPK 100
 
 
-
+template<size_t VALUE_SIZE, size_t INDEX_SIZE>
+struct graph_node {
+    value_t values[VALUE_SIZE];
+    idx_t indexes[INDEX_SIZE];
+};
 
 template<class A,class B>
 struct KernelPair{
@@ -286,12 +294,11 @@ static void astar_multi_start_search_batch(const std::vector<std::vector<std::pa
 	idx_t* d_result;
 	pq_value_t* d_pq_centroid;
 	graph_node<dim,degree>* d_graph;
-	cudaFuncSetAttribute(warp_independent_search_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, 131072);
 	
-	cudaMalloc(&d_data,sizeof(pq_idx_t) * num * dim);
+	cudaMalloc(&d_data,sizeof(pq_idx_t*) * num * dim);
 	cudaMalloc(&d_graph,sizeof(graph_node<dim,degree>) * num);
 	cudaMalloc(&d_pq_centroid,sizeof(pq_value_t) * 256 * dim);
-	cudaMemcpy(d_data,h_data,sizeof(pq_idx_t) * num * dim,cudaMemcpyHostToDevice);
+	cudaMemcpy(d_data,h_data,sizeof(pq_idx_t*) * num * dim,cudaMemcpyHostToDevice);
 	cudaMemcpy(d_graph,h_graph,sizeof(graph_node<dim,degree>) * num,cudaMemcpyHostToDevice);
 	cudaMemcpy(d_pq_centroid,pq_centroid,sizeof(pq_value_t) * 256 * dim,cudaMemcpyHostToDevice);
 
@@ -335,67 +342,34 @@ int main() {
 
 
     // 内存中保存pq量化数据
-    // pq_idx_t* h_data = new pq_idx_t[num_vertices * pq_dim];
-    // for (int i = 0; i < num_vertices * pq_dim; ++i) {
-    //     h_data[i] = static_cast<pq_idx_t>(rand());
-    // }
-	u_int64_t npts_u64, nchunks_u64;
-    pq_idx_t *h_data = nullptr;
-	load_bin<pq_idx_t>("/home/xy/anns/search/mini_dataset/disk_index_sift_learn_R64_L128_A1.2_pq_compressed.bin", h_data, npts_u64, nchunks_u64);
-
-
+    pq_idx_t* h_data = new pq_idx_t[num_vertices * pq_dim];
+    for (int i = 0; i < num_vertices * pq_dim; ++i) {
+        h_data[i] = static_cast<pq_idx_t>(rand());
+    }
     
     // vamana图结构，包含完整向量和索引
-    // graph_node<dim,degree>* h_graph = new graph_node<dim,degree>[num_vertices];
-    // for (int i = 0; i < num_vertices; ++i) {
-    //     for (int j = 0; j < dim; ++j)
-    //         h_graph[i].values[j] = static_cast<value_t>(rand()); // Random vertex index
-    //     for (int j = 0; j < degree; ++j)
-    //         h_graph[i].indexes[j] = static_cast<idx_t>(rand()) % num_vertices;
-    // }
-	std::vector<graph_node<dim,degree>> nodes;
-	read_node_bin("/home/xy/anns/search/mini_dataset/disk_index_sift_learn_R64_L128_A1.2_disk.index", nodes);
-	graph_node<dim,degree>* h_graph=nodes.data();
-
+    graph_node<dim,degree>* h_graph = new graph_node<dim,degree>[num_vertices];
+    for (int i = 0; i < num_vertices; ++i) {
+        for (int j = 0; j < dim; ++j)
+            h_graph[i].values[j] = static_cast<value_t>(rand()); // Random vertex index
+        for (int j = 0; j < degree; ++j)
+            h_graph[i].indexes[j] = static_cast<idx_t>(rand()) % num_vertices;
+    }
 
     // 查询
-    // std::vector<std::vector<std::pair<int,value_t>>> queries(num_queries);
-    // for (int i = 0; i < num_queries; ++i) {
-    //     // Each query has random values for different dimensions
-    //     for (int j = 0; j < dim; ++j) {
-    //         queries[i].push_back(std::make_pair(j, static_cast<value_t>(rand())));
-    //     }
-    // }
-
-	float *query = nullptr;
-	load_bin<value_t>("/home/xy/anns/search/mini_dataset/sift_query.fbin", query, npts_u64, nchunks_u64);
-	std::vector<std::vector<std::pair<int,value_t>>> queries(num_queries);
+    std::vector<std::vector<std::pair<int,value_t>>> queries(num_queries);
     for (int i = 0; i < num_queries; ++i) {
+        // Each query has random values for different dimensions
         for (int j = 0; j < dim; ++j) {
-            queries[i].push_back(std::make_pair(j, query[i*dim+j]));
+            queries[i].push_back(std::make_pair(j, static_cast<value_t>(rand())));
         }
     }
-	
-
 
     // pq中心表
-
-    // pq_value_t* pq_centroid=new pq_value_t[256 * dim];
-	// for (int i = 0; i < 256 * dim; ++i) {
-	// 	pq_centroid[i] = static_cast<pq_value_t>(rand());
-	// }
-
-	uint32_t *chunk_offsets = nullptr;
-    float *centroid = nullptr;
-    float *tables = nullptr;
-    float *tables_tr = nullptr;
-    load_pq_centroid_bin("/home/xy/anns/search/mini_dataset/disk_index_sift_learn_R64_L128_A1.2_pq_pivots.bin",128,chunk_offsets,centroid,tables,tables_tr);
-
-
-	pq_value_t* pq_centroid=new pq_value_t[256 * dim];
-	for (int i = 0; i < 256 * dim; ++i) {
-		pq_centroid[i] = tables_tr[i]+centroid[i/128];
-	}
+    pq_value_t* pq_centroid=new pq_value_t[256 * dim];
+        for (int i = 0; i < 256 * dim; ++i) {
+            pq_centroid[i] = static_cast<pq_value_t>(rand());
+        }
 
     // 结果保存
     std::vector<std::vector<idx_t>> results;
