@@ -141,7 +141,7 @@ void warp_independent_search_kernel(pq_idx_t* d_data,value_t* d_query,idx_t* d_r
 	value_t start_distance;
 	__syncthreads();
 
-	computePQTable(d_pq_centroid,d_query,&pq_table[0][0][0],pq_dim,k,dim,tid);
+	computePQTable(d_pq_centroid,d_query+(bid+cid)*dim,&pq_table[0][0][0],pq_dim,k,dim,tid);
 	__syncthreads();
 
 	value_t tmp[N_MULTIQUERY];
@@ -341,8 +341,7 @@ int main() {
     // }
 	u_int64_t npts_u64, nchunks_u64;
     pq_idx_t *h_data = nullptr;
-	load_bin<pq_idx_t>("/home/xy/anns/search/mini_dataset/disk_index_sift_learn_R64_L128_A1.2_pq_compressed.bin", h_data, npts_u64, nchunks_u64);
-
+	load_bin<pq_idx_t>("/home/xy/anns-2/ann_search/mini_graph/disk_index_sift_learn_R64_L128_A1.2_pq_compressed.bin", h_data, npts_u64, nchunks_u64);
 
     
     // vamana图结构，包含完整向量和索引
@@ -354,8 +353,12 @@ int main() {
     //         h_graph[i].indexes[j] = static_cast<idx_t>(rand()) % num_vertices;
     // }
 	std::vector<graph_node<dim,degree>> nodes;
-	read_node_bin("/home/xy/anns/search/mini_dataset/disk_index_sift_learn_R64_L128_A1.2_disk.index", nodes);
+	read_node_bin("/home/xy/anns-2/ann_search/mini_graph/disk_index_sift_learn_R64_L128_A1.2_disk.index", nodes);
 	graph_node<dim,degree>* h_graph=nodes.data();
+	for(int i=0;i<degree;i++)
+	{
+		std::cout<<"indexs:"<<static_cast<unsigned>(h_graph[0].indexes[i])<<std::endl;
+	}
 
 
     // 查询
@@ -368,13 +371,14 @@ int main() {
     // }
 
 	float *query = nullptr;
-	load_bin<value_t>("/home/xy/anns/search/mini_dataset/sift_query.fbin", query, npts_u64, nchunks_u64);
+	load_bin<value_t>("/home/xy/anns-2/ann_search/mini_graph/sift_query.fbin", query, npts_u64, nchunks_u64);
 	std::vector<std::vector<std::pair<int,value_t>>> queries(num_queries);
     for (int i = 0; i < num_queries; ++i) {
         for (int j = 0; j < dim; ++j) {
             queries[i].push_back(std::make_pair(j, query[i*dim+j]));
         }
     }
+	
 	
 
 
@@ -389,12 +393,12 @@ int main() {
     float *centroid = nullptr;
     float *tables = nullptr;
     float *tables_tr = nullptr;
-    load_pq_centroid_bin("/home/xy/anns/search/mini_dataset/disk_index_sift_learn_R64_L128_A1.2_pq_pivots.bin",128,chunk_offsets,centroid,tables,tables_tr);
+    load_pq_centroid_bin("/home/xy/anns-2/ann_search/mini_graph/disk_index_sift_learn_R64_L128_A1.2_pq_pivots.bin",128,chunk_offsets,centroid,tables,tables_tr);
 
 
 	pq_value_t* pq_centroid=new pq_value_t[256 * dim];
 	for (int i = 0; i < 256 * dim; ++i) {
-		pq_centroid[i] = tables_tr[i]+centroid[i/128];
+		pq_centroid[i] = tables_tr[i]+centroid[i/256];
 	}
 
     // 结果保存

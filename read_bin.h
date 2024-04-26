@@ -30,7 +30,7 @@ inline void load_bin(const std::string &bin_file, T *&data, size_t &npts, size_t
 template <typename T>
 inline void load_bin_impl(std::basic_istream<char> &reader, T *&data, size_t &npts, size_t &dim, size_t file_offset = 0);
 
-int read_node_bin(std::string filename,std::vector<graph_node<128,64>> nodes) {
+int read_node_bin(std::string filename,std::vector<graph_node<128,64>> &nodes) {
     const size_t HeaderSize = 4096; // 文件头部大小
     const size_t BlockSize = 4096; // 对齐块大小
     const size_t NodesPerBlock = 5; // 每个块中的节点数

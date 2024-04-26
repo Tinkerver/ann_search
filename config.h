@@ -19,7 +19,7 @@ typedef int UINT;
 #define ACC_BATCH_SIZE 1000000
 
 //for GPU
-#define FIXED_DEGREE 31
+#define FIXED_DEGREE 129
 #define FIXED_DEGREE_SHIFT 5
 
 //for CPU construction
