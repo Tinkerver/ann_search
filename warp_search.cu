@@ -31,11 +31,12 @@
 const int num_vertices = 1000000;
 const int dim = 128;
 const int pq_dim = 128;
-const int num_queries = 100;
+const int num_queries = 10000;
 const int degree = 64;
 const int k = 256;
 
 #define TOPK 100
+#define QUEUE_SIZE 128
 
 
 
@@ -94,15 +95,14 @@ __device__ void computePQTable(
 
 __global__
 void warp_independent_search_kernel(pq_idx_t* d_data,value_t* d_query,idx_t* d_result,graph_node<dim,degree>* d_graph,pq_value_t* d_pq_centroid, int num_query){
-	const int QUEUE_SIZE = TOPK;
     int bid = blockIdx.x * N_MULTIQUERY;
 	const int step = N_THREAD_IN_WARP;
     int tid = threadIdx.x;
 	int cid = tid / CRITICAL_STEP;
 	int subtid = tid % CRITICAL_STEP;
-#define BLOOM_FILTER_BIT64 8
+#define BLOOM_FILTER_BIT64 1500
 #define BLOOM_FILTER_BIT_SHIFT 3
-#define BLOOM_FILTER_NUM_HASH 7
+#define BLOOM_FILTER_NUM_HASH 20
 
 #ifndef __ENABLE_VISITED_DEL
 #define HASH_TABLE_CAPACITY (TOPK*4*16)
@@ -119,9 +119,17 @@ void warp_independent_search_kernel(pq_idx_t* d_data,value_t* d_query,idx_t* d_r
     KernelPair<dist_t,idx_t>* q;
     KernelPair<dist_t,idx_t>* topk;
 	value_t* dist_list;
+
+	// dist_list = new value_t[FIXED_DEGREE * N_MULTIPROBE];
+	// q= new KernelPair<dist_t,idx_t>[QUEUE_SIZE + 2];
+	// topk = new KernelPair<dist_t,idx_t>[TOPK + 1];
+	// pbf = new BlockedBloomFilter<BLOOM_FILTER_BIT64,BLOOM_FILTER_BIT_SHIFT,BLOOM_FILTER_NUM_HASH>();
+
+
+
 	if(subtid == 0){
 		dist_list = new value_t[FIXED_DEGREE * N_MULTIPROBE];
-		q= new KernelPair<dist_t,idx_t>[QUEUE_SIZE + 2];
+		q = new KernelPair<dist_t,idx_t>[QUEUE_SIZE + 2];
 		topk = new KernelPair<dist_t,idx_t>[TOPK + 1];
     	pbf = new BlockedBloomFilter<BLOOM_FILTER_BIT64,BLOOM_FILTER_BIT_SHIFT,BLOOM_FILTER_NUM_HASH>();
 
@@ -148,7 +156,7 @@ void warp_independent_search_kernel(pq_idx_t* d_data,value_t* d_query,idx_t* d_r
 	for(int j = 0;j < N_MULTIQUERY;++j){
 		tmp[j] = 0;
 		for(int i = tid;i < dim;i += step){
-			tmp[j] += (pq_table[j][i][d_data[i]]) * (pq_table[j][i][d_data[i]]); 
+			tmp[j] += (pq_table[j][i][d_data[i]]); 
 
 		}
 		for (int offset = 16; offset > 0; offset /= 2){
@@ -172,16 +180,25 @@ void warp_independent_search_kernel(pq_idx_t* d_data,value_t* d_query,idx_t* d_r
 		pbf->add(0);
 	}
 	__syncthreads();
+	int step_num;
+	step_num=0;
     while(heap_size[cid] > 1){
+		step_num++;
 		index_list_len[cid] = 0;
 		int current_heap_elements = heap_size[cid] - 1;
 		for(int k = 0;k < N_MULTIPROBE && k < current_heap_elements;++k){
 			KernelPair<dist_t,idx_t> now;
 			if(subtid == 0){
 				now = smmh2::pop_min(q,heap_size[cid]);
-#ifdef __ENABLE_VISITED_DEL
-				pbf->del(now.second);
-#endif
+				// if(bid==0)
+				// {
+				// 	printf("now:%f,%d\t",now.first,now.second);
+				// 	for(int i=0;i<heap_size[0];i++)
+				// 		printf("i:%d,idx:%d,dst:%f\t",i,q[i].second,q[i].first);
+				// }
+// #ifdef __ENABLE_VISITED_DEL
+// 				pbf->del(now.second);
+// #endif
 				if(k == 0 && topk_heap_size == TOPK && (topk[0].first <= now.first)){
 					++finished[cid];
 				}
@@ -192,13 +209,13 @@ void warp_independent_search_kernel(pq_idx_t* d_data,value_t* d_query,idx_t* d_r
 			if(subtid == 0){
 				topk[topk_heap_size++] = now;
 				push_heap(topk,topk + topk_heap_size);
-#ifdef __ENABLE_VISITED_DEL
-				pbf->add(now.second);
-#endif
+// #ifdef __ENABLE_VISITED_DEL
+// 				pbf->add(now.second);
+// #endif
 				if(topk_heap_size > TOPK){
-#ifdef __ENABLE_VISITED_DEL
-					pbf->del(topk[0].second);
-#endif
+// #ifdef __ENABLE_VISITED_DEL
+// 					pbf->del(topk[0].second);
+// #endif
 					pop_heap(topk,topk + topk_heap_size);
 					--topk_heap_size;
 				}
@@ -206,11 +223,13 @@ void warp_independent_search_kernel(pq_idx_t* d_data,value_t* d_query,idx_t* d_r
 					auto idx = d_graph[now.second].indexes[i];
 					if(subtid == 0){
 						if(pbf->test(idx)){
+							// if(bid==0)
+							// 	printf("so big%d\n",idx);
 							continue;
 						}
-#ifdef __DISABLE_SELECT_INSERT
-						pbf->add(idx);
-#endif
+// #ifdef __DISABLE_SELECT_INSERT
+// 						pbf->add(idx);
+// #endif
 						index_list[cid][index_list_len[cid]++] = idx;
 					}
 				}
@@ -224,13 +243,15 @@ void warp_independent_search_kernel(pq_idx_t* d_data,value_t* d_query,idx_t* d_r
 			for(int i = 0;i < index_list_len[nq];++i){
 				value_t tmp = 0;
 				for(int j = tid;j < dim;j += step){
-					tmp += pq_table[nq][j][d_data[index_list[nq][i] * dim + j]]*pq_table[nq][j][d_data[index_list[nq][i] * dim + j]];
+					tmp += pq_table[nq][j][d_data[index_list[nq][i] * dim + j]];
 				}
 				for (int offset = 16; offset > 0; offset /= 2){
 					tmp += __shfl_xor_sync(FULL_MASK, tmp, offset);
 				}
 				if(tid == nq * CRITICAL_STEP){
+					//printf("tmp:%f\n",tmp);
 					dist_list[i] = tmp;
+					//printf("dist_list:%f\n",dist_list[i]);
 				}
 			}
 		}
@@ -247,24 +268,31 @@ void warp_independent_search_kernel(pq_idx_t* d_data,value_t* d_query,idx_t* d_r
 				if(heap_size[cid] >= QUEUE_SIZE + 1 && q[2].first < kp.first){
 					continue;
 				}
-#ifdef __ENABLE_MULTIPROBE_DOUBLE_CHECK
-				if(pbf->test(kp.second))
-					continue;
-#endif
+// #ifdef __ENABLE_MULTIPROBE_DOUBLE_CHECK
+// 				if(pbf->test(kp.second))
+// 					continue;
+// #endif
 				smmh2::insert(q,heap_size[cid],kp);
 #ifndef __DISABLE_SELECT_INSERT
 				pbf->add(kp.second);
 #endif
 				if(heap_size[cid] >= QUEUE_SIZE + 2){
-#ifdef __ENABLE_VISITED_DEL
-					pbf->del(q[2].second);
-#endif
+// #ifdef __ENABLE_VISITED_DEL
+// 					pbf->del(q[2].second);
+// #endif
 					smmh2::pop_max(q,heap_size[cid]);
 				}
 			}
 		}
 		__syncthreads();
-    }
+		if(bid==0 && subtid == 0)
+		{
+			printf("\nquery:%d,step:%d,heapsize:%d\n",bid+cid,step_num,heap_size[cid]);
+			// for(int i=0;i<heap_size[0];i++)
+			// 	printf("i:%d,idx:%d\t",i,q[i].second);
+    	}
+	}
+
 
 	if(subtid == 0){
 		for(int i = 0;i < TOPK;++i){
@@ -355,10 +383,10 @@ int main() {
 	std::vector<graph_node<dim,degree>> nodes;
 	read_node_bin("/home/xy/anns-2/ann_search/mini_graph/disk_index_sift_learn_R64_L128_A1.2_disk.index", nodes);
 	graph_node<dim,degree>* h_graph=nodes.data();
-	for(int i=0;i<degree;i++)
-	{
-		std::cout<<"indexs:"<<static_cast<unsigned>(h_graph[0].indexes[i])<<std::endl;
-	}
+	// for(int i=0;i<degree;i++)
+	// {
+	// 	std::cout<<"indexs:"<<static_cast<unsigned>(h_graph[0].indexes[i])<<std::endl;
+	// }
 
 
     // 查询
@@ -412,7 +440,7 @@ int main() {
     for (int i = 0; i < results.size(); ++i) {
         std::cout << "Query " << i << ":" << std::endl;
         for (int j = 0; j < results[i].size(); ++j) {
-            std::cout << results[i][j] << " ";
+            std::cout << ' '<<results[i][j] << ",";
         }
         std::cout << std::endl;
     }
