@@ -7,7 +7,7 @@ int main(int argc, char *argv[])
 {
     if (argc != 3)
     {
-        printf("Usage: %s file_name ssd_offset\n");
+        printf("Usage: %s file_name ssd_offset\n", argv[0]);
         return 1;
     }
     FILE *fp = fopen(argv[1], "rb");

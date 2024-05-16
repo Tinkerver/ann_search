@@ -33,7 +33,7 @@
 const int num_vertices = 1000000;
 const int dim = 128;
 const int pq_dim = 128;
-const int num_queries = 10000;
+const int num_queries = 100;
 const int degree = 64;
 const int k = 256;
 const int num_queues_per_ssd = 128;
@@ -111,7 +111,8 @@ __device__ static void read_data(uint64_t start_lb, uint64_t num_lb, IoQueuePair
     uint64_t io_addr = prp1[offset / AEOLUS_DEVICE_PGSIZE] + offset % AEOLUS_DEVICE_PGSIZE;
 	offset += AEOLUS_HOST_PGSIZE;
     uint64_t io_addr2 = prp1[offset / AEOLUS_DEVICE_PGSIZE] + offset % AEOLUS_DEVICE_PGSIZE;
-    ssdqp[global_queue_id].submit(cid, NVME_OPCODE_READ, io_addr, io_addr2, start_lb & 0xffffffff, (start_lb >> 32) & 0xffffffff, NVME_RW_LIMITED_RETRY_MASK | (num_lb - 1));
+    ssdqp[global_queue_id].submit_fence(cid, NVME_OPCODE_READ, io_addr, io_addr2, start_lb & 0xffffffff, (start_lb >> 32) & 0xffffffff, NVME_RW_LIMITED_RETRY_MASK | (num_lb - 1));
+	// printf("qid %d cid %d sq_tail %d\n", global_queue_id, cid, ssdqp[global_queue_id].sq_tail);
     uint32_t status;
     ssdqp[global_queue_id].poll(status, cid);
     if (status != 0)
@@ -248,9 +249,11 @@ void warp_independent_search_kernel(pq_idx_t* d_data,value_t* d_query,idx_t* d_r
 					--topk_heap_size;
 				}
 				int num_lbs = max_io_size / AEOLUS_LB_SIZE;
-				int bytes_per_node = sizeof(graph_node<dim,degree>) + sizeof(int); // see read_bin.h
-				read_data(now.second/NodesPerBlock*num_lbs,num_lbs,ssdqp,prp1);
+				int bytes_per_node = sizeof(graph_node<dim,degree>);
+				read_data(num_lbs+now.second/NodesPerBlock*num_lbs,num_lbs,ssdqp,prp1); // see read_bin.h
 				graph_node<dim,degree> *now_node = (graph_node<dim,degree>*)((char*)iobuf+1ll*blockIdx.x*queue_depth*max_io_size+now.second%NodesPerBlock*bytes_per_node);
+					// printf("%d\n", now.second);
+					// assert(now.second < num_vertices);
 				for(int i = 0;i < degree;++i){
 					auto idx = now_node->indexes[i];
 					if(subtid == 0){
@@ -376,7 +379,8 @@ static void astar_multi_start_search_batch(const std::vector<std::vector<std::pa
 	PinnedBuffer *buf = new PinnedBuffer(devices[0], 1ll * num_queues_per_ssd * queue_depth * max_io_size, max_io_size);
 
 	// warp_independent_search_kernel<<<queries.size()/N_MULTIQUERY,32>>>(d_data,d_query,d_result,d_graph,d_pq_centroid,queries.size());
-	warp_independent_search_kernel<<<queries.size()/N_MULTIQUERY,32,sizeof(pq_value_t) * N_MULTIQUERY * pq_dim * 256>>>(d_data,d_query,d_result,d_pq_centroid,queries.size(), ctrl->get_io_queue_pair(), buf->get_d_prp_phys(), *buf);
+	warp_independent_search_kernel<<<queries.size()/N_MULTIQUERY,32,sizeof(pq_value_t) * N_MULTIQUERY * pq_dim * 256>>>(d_data,d_query,d_result,d_pq_centroid,queries.size(), ctrl->get_io_queue_pair(), buf->get_d_iobuf_phys(), *buf);
+	AEOLUS_CUDA_CHECK(cudaDeviceSynchronize());
 
 	delete buf;
 	delete ctrl;
@@ -409,7 +413,7 @@ int main() {
     // }
 	u_int64_t npts_u64, nchunks_u64;
     pq_idx_t *h_data = nullptr;
-	load_bin<pq_idx_t>("/home/xy/anns-2/ann_search/mini_graph/disk_index_sift_learn_R64_L128_A1.2_pq_compressed.bin", h_data, npts_u64, nchunks_u64);
+	load_bin<pq_idx_t>("/home/zhzh/1Mgraph_index/disk_index_sift_learn_R64_L128_A1.2_pq_compressed.bin", h_data, npts_u64, nchunks_u64);
 
     
     // vamana图结构，包含完整向量和索引
@@ -439,7 +443,7 @@ int main() {
     // }
 
 	float *query = nullptr;
-	load_bin<value_t>("/home/xy/anns-2/ann_search/mini_graph/sift_query.fbin", query, npts_u64, nchunks_u64);
+	load_bin<value_t>("/home/zhzh/1Mgraph_index/sift_query.fbin", query, npts_u64, nchunks_u64);
 	std::vector<std::vector<std::pair<int,value_t>>> queries(num_queries);
     for (int i = 0; i < num_queries; ++i) {
         for (int j = 0; j < dim; ++j) {
@@ -461,7 +465,7 @@ int main() {
     float *centroid = nullptr;
     float *tables = nullptr;
     float *tables_tr = nullptr;
-    load_pq_centroid_bin("/home/xy/anns-2/ann_search/mini_graph/disk_index_sift_learn_R64_L128_A1.2_pq_pivots.bin",128,chunk_offsets,centroid,tables,tables_tr);
+    load_pq_centroid_bin("/home/zhzh/1Mgraph_index/disk_index_sift_learn_R64_L128_A1.2_pq_pivots.bin",128,chunk_offsets,centroid,tables,tables_tr);
 
 
 	pq_value_t* pq_centroid=new pq_value_t[256 * dim];
