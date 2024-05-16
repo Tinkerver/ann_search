@@ -20,18 +20,21 @@
 // #include"type_def.h"
 // #include"graph_node.h"
 #include"read_bin.h"
+#include"result_save.h"
+#include"vanilla_list.h"
 
 #define FULL_MASK 0xffffffff
 #define N_THREAD_IN_WARP 32
 #define N_MULTIQUERY 1
 #define CRITICAL_STEP (N_THREAD_IN_WARP/N_MULTIQUERY)
-#define N_MULTIPROBE 1
+#define N_MULTIPROBE 8
 #define FINISH_CNT 1
+//#define __HASH_TEST
 
 const int num_vertices = 1000000;
 const int dim = 128;
 const int pq_dim = 128;
-const int num_queries = 10000;
+const int num_queries = 100;
 const int degree = 64;
 const int k = 256;
 
@@ -100,9 +103,9 @@ void warp_independent_search_kernel(pq_idx_t* d_data,value_t* d_query,idx_t* d_r
     int tid = threadIdx.x;
 	int cid = tid / CRITICAL_STEP;
 	int subtid = tid % CRITICAL_STEP;
-#define BLOOM_FILTER_BIT64 1500
+#define BLOOM_FILTER_BIT64 3000
 #define BLOOM_FILTER_BIT_SHIFT 3
-#define BLOOM_FILTER_NUM_HASH 20
+#define BLOOM_FILTER_NUM_HASH 7
 
 #ifndef __ENABLE_VISITED_DEL
 #define HASH_TABLE_CAPACITY (TOPK*4*16)
@@ -115,7 +118,11 @@ void warp_independent_search_kernel(pq_idx_t* d_data,value_t* d_query,idx_t* d_r
 #define HASH_TABLE_CAPACITY (TOPK*4*16+500)
 #endif
 
+#ifdef __HASH_TEST
+	VanillaList* pbf;
+#else
     BlockedBloomFilter<BLOOM_FILTER_BIT64,BLOOM_FILTER_BIT_SHIFT,BLOOM_FILTER_NUM_HASH>* pbf;
+#endif
     KernelPair<dist_t,idx_t>* q;
     KernelPair<dist_t,idx_t>* topk;
 	value_t* dist_list;
@@ -131,7 +138,11 @@ void warp_independent_search_kernel(pq_idx_t* d_data,value_t* d_query,idx_t* d_r
 		dist_list = new value_t[FIXED_DEGREE * N_MULTIPROBE];
 		q = new KernelPair<dist_t,idx_t>[QUEUE_SIZE + 2];
 		topk = new KernelPair<dist_t,idx_t>[TOPK + 1];
+#ifdef __HASH_TEST
+		pbf = new VanillaList();
+#else
     	pbf = new BlockedBloomFilter<BLOOM_FILTER_BIT64,BLOOM_FILTER_BIT_SHIFT,BLOOM_FILTER_NUM_HASH>();
+#endif
 
 	//pbf = new VanillaList();
 	}
@@ -141,7 +152,7 @@ void warp_independent_search_kernel(pq_idx_t* d_data,value_t* d_query,idx_t* d_r
 
 	__shared__ int finished[N_MULTIQUERY];
 	__shared__ idx_t index_list[N_MULTIQUERY][FIXED_DEGREE * N_MULTIPROBE];
-	__shared__ char index_list_len[N_MULTIQUERY];
+	__shared__ int index_list_len[N_MULTIQUERY];
 	// __shared__ pq_value_t pq_table[N_MULTIQUERY][pq_dim][k];
 	extern __shared__ pq_value_t dynamic_shared_memory[];
 	pq_value_t (*pq_table)[pq_dim][k] = (pq_value_t (*)[pq_dim][k])dynamic_shared_memory;
@@ -268,10 +279,10 @@ void warp_independent_search_kernel(pq_idx_t* d_data,value_t* d_query,idx_t* d_r
 				if(heap_size[cid] >= QUEUE_SIZE + 1 && q[2].first < kp.first){
 					continue;
 				}
-// #ifdef __ENABLE_MULTIPROBE_DOUBLE_CHECK
-// 				if(pbf->test(kp.second))
-// 					continue;
-// #endif
+#if N_MULTIPROBE > 1
+				if(pbf->test(kp.second))
+					continue;
+#endif
 				smmh2::insert(q,heap_size[cid],kp);
 #ifndef __DISABLE_SELECT_INSERT
 				pbf->add(kp.second);
@@ -299,6 +310,7 @@ void warp_independent_search_kernel(pq_idx_t* d_data,value_t* d_query,idx_t* d_r
 			auto now = pop_heap(topk,topk + topk_heap_size - i);
 			d_result[(bid + cid) * TOPK + TOPK - 1 - i] = now.second;
 		}
+		//printf("\nquery:%d,pbflen:%d\n",bid+cid,pbf->len);
 		delete[] q;
 		delete[] topk;
     	delete pbf;
@@ -434,6 +446,8 @@ int main() {
 
     // Call the function
     astar_multi_start_search_batch(queries, TOPK, results, h_data, h_graph, pq_centroid, num_vertices);
+
+	saveToCSV(results, "/home/xy/anns-2/ann_search/results.csv");
 
     // 结果输出
     std::cout << "Results:" << std::endl;
