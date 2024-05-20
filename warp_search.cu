@@ -25,10 +25,11 @@
 
 #define FULL_MASK 0xffffffff
 #define N_THREAD_IN_WARP 32
-#define N_MULTIQUERY 1
-#define CRITICAL_STEP (N_THREAD_IN_WARP/N_MULTIQUERY)
+#define N_MULTIQUERY 5
+#define CRITICAL_STEP 32
 #define N_MULTIPROBE 8
 #define FINISH_CNT 1
+#define N_THREAD_IN_BLOCK 160
 //#define __HASH_TEST
 
 const int num_vertices = 1000000;
@@ -78,26 +79,25 @@ __device__ void computePQTable(
     int step = 32;
 
 
-	for(int i = 0;i < N_MULTIQUERY;++i){
-		for (int subvector_idx = 0; subvector_idx < pq_dim; ++subvector_idx) {
-			for (int centroid_idx = tid; centroid_idx < k; centroid_idx += step) {
-				pq_value_t distance = 0;
-				for (int dim_idx = 0; dim_idx < subvector_dim; ++dim_idx) {
-					int query_dim_idx = i * dim + subvector_idx * subvector_dim + dim_idx;
-					int centroid_dim_idx = (subvector_idx * k + centroid_idx) * subvector_dim + dim_idx;
-					
-					pq_value_t diff = d_query[query_dim_idx] - d_pq_centroid[centroid_dim_idx];
-					distance += diff * diff;
-				}
+	for (int subvector_idx = 0; subvector_idx < pq_dim; ++subvector_idx) {
+		for (int centroid_idx = tid; centroid_idx < k; centroid_idx += step) {
+			pq_value_t distance = 0;
+			for (int dim_idx = 0; dim_idx < subvector_dim; ++dim_idx) {
+				int query_dim_idx = subvector_idx * subvector_dim + dim_idx;
+				int centroid_dim_idx = (subvector_idx * k + centroid_idx) * subvector_dim + dim_idx;
 				
-				pq_table[i * dim * k * pq_dim + subvector_idx * k + centroid_idx] = distance;
+				pq_value_t diff = d_query[query_dim_idx] - d_pq_centroid[centroid_dim_idx];
+				distance += diff * diff;
 			}
+			
+			pq_table[subvector_idx * k + centroid_idx] = distance;
 		}
 	}
+	
 }
 
 __global__
-void warp_independent_search_kernel(pq_idx_t* d_data,value_t* d_query,idx_t* d_result,graph_node<dim,degree>* d_graph,pq_value_t* d_pq_centroid, int num_query){
+void warp_independent_search_kernel(pq_idx_t* d_data,value_t* d_query,idx_t* d_result,graph_node<dim,degree>* d_graph,pq_value_t* d_pq_centroid,pq_value_t* d_pq_table, int num_query){
     int bid = blockIdx.x * N_MULTIQUERY;
 	const int step = N_THREAD_IN_WARP;
     int tid = threadIdx.x;
@@ -154,27 +154,26 @@ void warp_independent_search_kernel(pq_idx_t* d_data,value_t* d_query,idx_t* d_r
 	__shared__ idx_t index_list[N_MULTIQUERY][FIXED_DEGREE * N_MULTIPROBE];
 	__shared__ int index_list_len[N_MULTIQUERY];
 	// __shared__ pq_value_t pq_table[N_MULTIQUERY][pq_dim][k];
-	extern __shared__ pq_value_t dynamic_shared_memory[];
-	pq_value_t (*pq_table)[pq_dim][k] = (pq_value_t (*)[pq_dim][k])dynamic_shared_memory;
+	pq_value_t (*pq_table)[pq_dim][k] = (pq_value_t (*)[pq_dim][k])d_pq_table;
 	
 	value_t start_distance;
 	__syncthreads();
 
-	computePQTable(d_pq_centroid,d_query+(bid+cid)*dim,&pq_table[0][0][0],pq_dim,k,dim,tid);
+	computePQTable(d_pq_centroid,d_query+(bid+cid)*dim,&pq_table[bid+cid][0][0],pq_dim,k,dim,subtid);
 	__syncthreads();
 
 	value_t tmp[N_MULTIQUERY];
-	for(int j = 0;j < N_MULTIQUERY;++j){
-		tmp[j] = 0;
-		for(int i = tid;i < dim;i += step){
-			tmp[j] += (pq_table[j][i][d_data[i]]); 
-
-		}
-		for (int offset = 16; offset > 0; offset /= 2){
-				tmp[j] += __shfl_xor_sync(FULL_MASK, tmp[j], offset);
-		}
+	int j=cid;
+	tmp[j] = 0;
+	for(int i = subtid;i < dim;i += step){
+		tmp[j] += (pq_table[bid+j][i][d_data[i]]); 
 	}
-	if(subtid == 0){
+	if(bid==1)
+		printf("tid:%d,sum:%f\t",tid,tmp[j]);
+	for (int offset = 16; offset > 0; offset /= 2){
+			tmp[j] += __shfl_xor_sync(FULL_MASK, tmp[j], offset);
+	}
+if(subtid == 0){
 		start_distance = tmp[cid];
 	}
 	__syncthreads();
@@ -249,21 +248,20 @@ void warp_independent_search_kernel(pq_idx_t* d_data,value_t* d_query,idx_t* d_r
 		if(finished[cid] >= FINISH_CNT)
 			break;
 		__syncthreads();
-
-		for(int nq = 0;nq < N_MULTIQUERY;++nq){
-			for(int i = 0;i < index_list_len[nq];++i){
-				value_t tmp = 0;
-				for(int j = tid;j < dim;j += step){
-					tmp += pq_table[nq][j][d_data[index_list[nq][i] * dim + j]];
-				}
-				for (int offset = 16; offset > 0; offset /= 2){
-					tmp += __shfl_xor_sync(FULL_MASK, tmp, offset);
-				}
-				if(tid == nq * CRITICAL_STEP){
-					//printf("tmp:%f\n",tmp);
-					dist_list[i] = tmp;
-					//printf("dist_list:%f\n",dist_list[i]);
-				}
+		
+		int nq=cid;
+		for(int i = 0;i < index_list_len[nq];++i){
+			value_t tmp = 0;
+			for(int j = subtid;j < dim;j += step){
+				tmp += pq_table[bid+nq][j][d_data[index_list[nq][i] * dim + j]];
+			}
+			for (int offset = 16; offset > 0; offset /= 2){
+				tmp += __shfl_xor_sync(FULL_MASK, tmp, offset);
+			}
+			if(subtid==0){
+				//printf("tmp:%f\n",tmp);
+				dist_list[i] = tmp;
+				//printf("dist_list:%f\n",dist_list[i]);
 			}
 		}
 
@@ -296,9 +294,10 @@ void warp_independent_search_kernel(pq_idx_t* d_data,value_t* d_query,idx_t* d_r
 			}
 		}
 		__syncthreads();
-		if(bid==0 && subtid == 0)
+		if(bid+cid==1 && subtid == 0)
 		{
-			printf("\nquery:%d,step:%d,heapsize:%d\n",bid+cid,step_num,heap_size[cid]);
+			//printf("\nquery:%d,step:%d,heapsize:%d\n",bid+cid,step_num,heap_size[cid]);
+			//printf("dist:%f,idx:%d\t",q[1].first,q[1].second);
 			// for(int i=0;i<heap_size[0];i++)
 			// 	printf("i:%d,idx:%d\t",i,q[i].second);
     	}
@@ -325,6 +324,7 @@ static void astar_multi_start_search_batch(const std::vector<std::vector<std::pa
 	value_t* d_query;
 	idx_t* d_result;
 	pq_value_t* d_pq_centroid;
+	pq_value_t* d_pq_table;
 	graph_node<dim,degree>* d_graph;
 	cudaFuncSetAttribute(warp_independent_search_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, 131072);
 	
@@ -347,12 +347,13 @@ static void astar_multi_start_search_batch(const std::vector<std::vector<std::pa
 
 	cudaMalloc(&d_query,sizeof(value_t) * queries.size() * dim);
 	cudaMalloc(&d_result,sizeof(idx_t) * queries.size() * TOPK);
+	cudaMalloc(&d_pq_table,sizeof(pq_value_t) * N_MULTIQUERY * pq_dim * 256 * 100);
 	
 	cudaMemcpy(d_query,h_query.get(),sizeof(value_t) * queries.size() * dim,cudaMemcpyHostToDevice);
 
 
 	// warp_independent_search_kernel<<<queries.size()/N_MULTIQUERY,32>>>(d_data,d_query,d_result,d_graph,d_pq_centroid,queries.size());
-	warp_independent_search_kernel<<<queries.size()/N_MULTIQUERY,32,sizeof(pq_value_t) * N_MULTIQUERY * pq_dim * 256>>>(d_data,d_query,d_result,d_graph,d_pq_centroid,queries.size());
+	warp_independent_search_kernel<<<queries.size()/N_MULTIQUERY,N_THREAD_IN_BLOCK>>>(d_data,d_query,d_result,d_graph,d_pq_centroid,d_pq_table,queries.size());
 
 	cudaMemcpy(h_result.get(),d_result,sizeof(idx_t) * queries.size() * TOPK,cudaMemcpyDeviceToHost);
 
@@ -372,7 +373,7 @@ static void astar_multi_start_search_batch(const std::vector<std::vector<std::pa
 
 
 int main() {
-
+	cudaSetDevice(1);
 
     // 内存中保存pq量化数据
     // pq_idx_t* h_data = new pq_idx_t[num_vertices * pq_dim];
