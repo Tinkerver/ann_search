@@ -10,7 +10,7 @@
 #include"graph_node.h"
 
 
-void load_pq_centroid_bin(const char *file_path, size_t num_chunks,uint32_t *&chunk_offsets,float *&centroid,\
+void load_pq_centroid_bin(const char *file_path, size_t &num_chunks,uint32_t *&chunk_offsets,float *&centroid,\
     float *&tables,float *&tables_tr);
 
 template <typename T>
@@ -71,7 +71,7 @@ int read_node_bin(std::string filename,std::vector<graph_node<128,64>> &nodes) {
     return 0;
 }
 
-void load_pq_centroid_bin(const char *file_path, size_t num_chunks,uint32_t *&chunk_offsets,float *&centroid,\
+void load_pq_centroid_bin(const char *file_path, size_t &num_chunks,uint32_t *&chunk_offsets,float *&centroid,\
     float *&tables,float *&tables_tr)
 {
 
@@ -137,6 +137,7 @@ void load_pq_centroid_bin(const char *file_path, size_t num_chunks,uint32_t *&ch
     }
 
     int n_chunks = nr - 1;
+    num_chunks=n_chunks;
     std::cout << "Loaded PQ Pivots: #ctrs: " << NUM_PQ_CENTROIDS << ", #dims: " << ndims
                   << ", #chunks: " << n_chunks << std::endl;
 

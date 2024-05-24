@@ -1,4 +1,5 @@
 #include<vector>
+#include<fstream>
 #include"config.h"
 #include<stdio.h>
 #include<stdlib.h>
@@ -12,9 +13,6 @@
 #include"bloomfilter.h"
 #include"blocked_bloomfilter.h"
 
-#include<vector>
-#include<stdio.h>
-#include<stdlib.h>
 #include<iostream>
 
 // #include"type_def.h"
@@ -25,17 +23,17 @@
 
 #define FULL_MASK 0xffffffff
 #define N_THREAD_IN_WARP 32
-#define N_MULTIQUERY 5
+#define N_MULTIQUERY 4
 #define CRITICAL_STEP 32
 #define N_MULTIPROBE 8
 #define FINISH_CNT 1
-#define N_THREAD_IN_BLOCK 160
+#define N_THREAD_IN_BLOCK 128
 //#define __HASH_TEST
 
 const int num_vertices = 1000000;
 const int dim = 128;
 const int pq_dim = 128;
-const int num_queries = 100;
+const int num_queries = 10000;
 const int degree = 64;
 const int k = 256;
 
@@ -75,7 +73,7 @@ __device__ void computePQTable(
     int dim,                    // 查询向量的维度
     int tid)                    
 {
-    int subvector_dim = dim / pq_dim; // 子空间的维度
+    int subvector_dim = (dim+pq_dim-1) / pq_dim; // 子空间的维度
     int step = 32;
 
 
@@ -84,8 +82,9 @@ __device__ void computePQTable(
 			pq_value_t distance = 0;
 			for (int dim_idx = 0; dim_idx < subvector_dim; ++dim_idx) {
 				int query_dim_idx = subvector_idx * subvector_dim + dim_idx;
-				int centroid_dim_idx = (subvector_idx * k + centroid_idx) * subvector_dim + dim_idx;
-				
+				int centroid_dim_idx = (centroid_idx * pq_dim + subvector_idx) * subvector_dim + dim_idx;
+				if(subvector_idx>48&&dim_idx==1)
+					continue;
 				pq_value_t diff = d_query[query_dim_idx] - d_pq_centroid[centroid_dim_idx];
 				distance += diff * diff;
 			}
@@ -103,9 +102,9 @@ void warp_independent_search_kernel(pq_idx_t* d_data,value_t* d_query,idx_t* d_r
     int tid = threadIdx.x;
 	int cid = tid / CRITICAL_STEP;
 	int subtid = tid % CRITICAL_STEP;
-#define BLOOM_FILTER_BIT64 3000
+#define BLOOM_FILTER_BIT64 1500
 #define BLOOM_FILTER_BIT_SHIFT 3
-#define BLOOM_FILTER_NUM_HASH 7
+#define BLOOM_FILTER_NUM_HASH 20
 
 #ifndef __ENABLE_VISITED_DEL
 #define HASH_TABLE_CAPACITY (TOPK*4*16)
@@ -135,7 +134,9 @@ void warp_independent_search_kernel(pq_idx_t* d_data,value_t* d_query,idx_t* d_r
 
 
 	if(subtid == 0){
-		dist_list = new value_t[FIXED_DEGREE * N_MULTIPROBE];
+		//dist_list = new value_t[FIXED_DEGREE * N_MULTIPROBE*2];
+		value_t dist_list2[FIXED_DEGREE * N_MULTIPROBE];
+		dist_list=dist_list2;
 		q = new KernelPair<dist_t,idx_t>[QUEUE_SIZE + 2];
 		topk = new KernelPair<dist_t,idx_t>[TOPK + 1];
 #ifdef __HASH_TEST
@@ -173,7 +174,7 @@ void warp_independent_search_kernel(pq_idx_t* d_data,value_t* d_query,idx_t* d_r
 	for (int offset = 16; offset > 0; offset /= 2){
 			tmp[j] += __shfl_xor_sync(FULL_MASK, tmp[j], offset);
 	}
-if(subtid == 0){
+	if(subtid == 0){
 		start_distance = tmp[cid];
 	}
 	__syncthreads();
@@ -347,13 +348,15 @@ static void astar_multi_start_search_batch(const std::vector<std::vector<std::pa
 
 	cudaMalloc(&d_query,sizeof(value_t) * queries.size() * dim);
 	cudaMalloc(&d_result,sizeof(idx_t) * queries.size() * TOPK);
-	cudaMalloc(&d_pq_table,sizeof(pq_value_t) * N_MULTIQUERY * pq_dim * 256 * 100);
+	cudaMalloc(&d_pq_table,sizeof(pq_value_t) * pq_dim * 256 * 10000);
 	
 	cudaMemcpy(d_query,h_query.get(),sizeof(value_t) * queries.size() * dim,cudaMemcpyHostToDevice);
 
 
 	// warp_independent_search_kernel<<<queries.size()/N_MULTIQUERY,32>>>(d_data,d_query,d_result,d_graph,d_pq_centroid,queries.size());
-	warp_independent_search_kernel<<<queries.size()/N_MULTIQUERY,N_THREAD_IN_BLOCK>>>(d_data,d_query,d_result,d_graph,d_pq_centroid,d_pq_table,queries.size());
+	warp_independent_search_kernel<<<queries.size()/N_MULTIQUERY,N_THREAD_IN_BLOCK,sizeof(pq_value_t)  * pq_dim * 256>>>(d_data,d_query,d_result,d_graph,d_pq_centroid,d_pq_table,queries.size());
+
+	cudaDeviceSynchronize();
 
 	cudaMemcpy(h_result.get(),d_result,sizeof(idx_t) * queries.size() * TOPK,cudaMemcpyDeviceToHost);
 
@@ -373,7 +376,7 @@ static void astar_multi_start_search_batch(const std::vector<std::vector<std::pa
 
 
 int main() {
-	cudaSetDevice(1);
+	cudaSetDevice(0);
 
     // 内存中保存pq量化数据
     // pq_idx_t* h_data = new pq_idx_t[num_vertices * pq_dim];
@@ -434,13 +437,42 @@ int main() {
     float *centroid = nullptr;
     float *tables = nullptr;
     float *tables_tr = nullptr;
-    load_pq_centroid_bin("/home/xy/anns-2/ann_search/mini_graph/disk_index_sift_learn_R64_L128_A1.2_pq_pivots.bin",128,chunk_offsets,centroid,tables,tables_tr);
+	size_t num_chunks = pq_dim;
+    load_pq_centroid_bin("/home/xy/anns-2/ann_search/mini_graph/disk_index_sift_learn_R64_L128_A1.2_pq_pivots.bin",num_chunks,chunk_offsets,centroid,tables,tables_tr);
 
 
-	pq_value_t* pq_centroid=new pq_value_t[256 * dim];
+	pq_value_t* pq_centroid_tmp=new pq_value_t[256 * dim];
 	for (int i = 0; i < 256 * dim; ++i) {
-		pq_centroid[i] = tables_tr[i]+centroid[i/256];
+		pq_centroid_tmp[i] = tables[i]+centroid[i%128];
 	}
+
+	int subvector_dim = (dim+pq_dim-1) / pq_dim;
+
+	pq_value_t* pq_centroid=new pq_value_t[256 * pq_dim * subvector_dim];
+
+	if(pq_dim==80)
+		for(int i=0;i<256;i++)
+		{
+			for(int j=0;j<pq_dim;j++)
+			{
+				for(int h=0;h<subvector_dim;h++)
+				{
+					if(j<48)
+						pq_centroid[(i*pq_dim+j)*subvector_dim+h]=pq_centroid_tmp[i*128+j*2+h];
+					else
+					{
+						if(h==0)
+							pq_centroid[(i*pq_dim+j)*subvector_dim+h]=pq_centroid_tmp[i*128+j+48];
+						else
+							pq_centroid[(i*pq_dim+j)*subvector_dim+h]=0;
+					}
+				}
+			}
+		}
+	else
+		pq_centroid=pq_centroid_tmp;
+
+
 
     // 结果保存
     std::vector<std::vector<idx_t>> results;

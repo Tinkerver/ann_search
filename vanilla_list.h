@@ -1,7 +1,7 @@
 #pragma once
 
 struct VanillaList{
-	const static int capacity = 2000;
+	const static int capacity = 1500;
     idx_t data[capacity];
     int len = 0;
 
