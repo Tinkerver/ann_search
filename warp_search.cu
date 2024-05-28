@@ -23,12 +23,15 @@
 
 #define FULL_MASK 0xffffffff
 #define N_THREAD_IN_WARP 32
-#define N_MULTIQUERY 4
+#define N_MULTIQUERY 1
 #define CRITICAL_STEP 32
-#define N_MULTIPROBE 8
+#define N_MULTIPROBE 1
 #define FINISH_CNT 1
-#define N_THREAD_IN_BLOCK 128
+#define N_THREAD_IN_BLOCK 32
 //#define __HASH_TEST
+#define BLOOM_FILTER_BIT64 4000
+#define BLOOM_FILTER_BIT_SHIFT 3
+#define BLOOM_FILTER_NUM_HASH 8
 
 const int num_vertices = 1000000;
 const int dim = 128;
@@ -38,7 +41,7 @@ const int degree = 64;
 const int k = 256;
 
 #define TOPK 100
-#define QUEUE_SIZE 128
+#define QUEUE_SIZE 100
 
 
 
@@ -96,15 +99,13 @@ __device__ void computePQTable(
 }
 
 __global__
-void warp_independent_search_kernel(pq_idx_t* d_data,value_t* d_query,idx_t* d_result,graph_node<dim,degree>* d_graph,pq_value_t* d_pq_centroid,pq_value_t* d_pq_table, int num_query){
-    int bid = blockIdx.x * N_MULTIQUERY;
+void warp_independent_search_kernel(pq_idx_t* d_data,value_t* d_query,idx_t* d_result,graph_node<dim,degree>* d_graph,\
+	pq_value_t* d_pq_centroid,pq_value_t* d_pq_table,value_t* d_datadist_list,BLOOMFILTER_DATA_T* d_hashdata, int num_query){
+    int bid = (blockIdx.x * N_MULTIQUERY) % 10000;
 	const int step = N_THREAD_IN_WARP;
     int tid = threadIdx.x;
 	int cid = tid / CRITICAL_STEP;
 	int subtid = tid % CRITICAL_STEP;
-#define BLOOM_FILTER_BIT64 1500
-#define BLOOM_FILTER_BIT_SHIFT 3
-#define BLOOM_FILTER_NUM_HASH 20
 
 #ifndef __ENABLE_VISITED_DEL
 #define HASH_TABLE_CAPACITY (TOPK*4*16)
@@ -124,7 +125,7 @@ void warp_independent_search_kernel(pq_idx_t* d_data,value_t* d_query,idx_t* d_r
 #endif
     KernelPair<dist_t,idx_t>* q;
     KernelPair<dist_t,idx_t>* topk;
-	value_t* dist_list;
+	value_t* dist_list=d_datadist_list+(bid+cid) * FIXED_DEGREE * N_MULTIPROBE;
 
 	// dist_list = new value_t[FIXED_DEGREE * N_MULTIPROBE];
 	// q= new KernelPair<dist_t,idx_t>[QUEUE_SIZE + 2];
@@ -134,15 +135,15 @@ void warp_independent_search_kernel(pq_idx_t* d_data,value_t* d_query,idx_t* d_r
 
 
 	if(subtid == 0){
-		//dist_list = new value_t[FIXED_DEGREE * N_MULTIPROBE*2];
-		value_t dist_list2[FIXED_DEGREE * N_MULTIPROBE];
-		dist_list=dist_list2;
+		//dist_list = new value_t[FIXED_DEGREE * N_MULTIPROBE];
+		// value_t dist_list2[FIXED_DEGREE * N_MULTIPROBE];
+		// dist_list=dist_list2;
 		q = new KernelPair<dist_t,idx_t>[QUEUE_SIZE + 2];
 		topk = new KernelPair<dist_t,idx_t>[TOPK + 1];
 #ifdef __HASH_TEST
 		pbf = new VanillaList();
 #else
-    	pbf = new BlockedBloomFilter<BLOOM_FILTER_BIT64,BLOOM_FILTER_BIT_SHIFT,BLOOM_FILTER_NUM_HASH>();
+    	pbf = new BlockedBloomFilter<BLOOM_FILTER_BIT64,BLOOM_FILTER_BIT_SHIFT,BLOOM_FILTER_NUM_HASH>(d_hashdata +(bid+cid)*BLOOM_FILTER_BIT64 * 2);
 #endif
 
 	//pbf = new VanillaList();
@@ -169,8 +170,8 @@ void warp_independent_search_kernel(pq_idx_t* d_data,value_t* d_query,idx_t* d_r
 	for(int i = subtid;i < dim;i += step){
 		tmp[j] += (pq_table[bid+j][i][d_data[i]]); 
 	}
-	if(bid==1)
-		printf("tid:%d,sum:%f\t",tid,tmp[j]);
+	// if(bid==1)
+	// 	printf("tid:%d,sum:%f\t",tid,tmp[j]);
 	for (int offset = 16; offset > 0; offset /= 2){
 			tmp[j] += __shfl_xor_sync(FULL_MASK, tmp[j], offset);
 	}
@@ -314,7 +315,7 @@ void warp_independent_search_kernel(pq_idx_t* d_data,value_t* d_query,idx_t* d_r
 		delete[] q;
 		delete[] topk;
     	delete pbf;
-    	delete[] dist_list;
+    	//delete[] dist_list;
 	}
 }
 
@@ -326,6 +327,9 @@ static void astar_multi_start_search_batch(const std::vector<std::vector<std::pa
 	idx_t* d_result;
 	pq_value_t* d_pq_centroid;
 	pq_value_t* d_pq_table;
+	value_t* d_datadist_list;
+	BLOOMFILTER_DATA_T* d_hashdata;
+
 	graph_node<dim,degree>* d_graph;
 	cudaFuncSetAttribute(warp_independent_search_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, 131072);
 	
@@ -348,13 +352,16 @@ static void astar_multi_start_search_batch(const std::vector<std::vector<std::pa
 
 	cudaMalloc(&d_query,sizeof(value_t) * queries.size() * dim);
 	cudaMalloc(&d_result,sizeof(idx_t) * queries.size() * TOPK);
-	cudaMalloc(&d_pq_table,sizeof(pq_value_t) * pq_dim * 256 * 10000);
+	cudaMalloc(&d_pq_table,sizeof(pq_value_t) * pq_dim * 256 * queries.size());
+	cudaMalloc(&d_datadist_list,sizeof(value_t) * queries.size() * FIXED_DEGREE * N_MULTIPROBE);
+	cudaMalloc(&d_hashdata,sizeof(BLOOMFILTER_DATA_T)*queries.size()* BLOOM_FILTER_BIT64 * BLOOMFILTER_SIZE64MULT);
 	
 	cudaMemcpy(d_query,h_query.get(),sizeof(value_t) * queries.size() * dim,cudaMemcpyHostToDevice);
 
 
 	// warp_independent_search_kernel<<<queries.size()/N_MULTIQUERY,32>>>(d_data,d_query,d_result,d_graph,d_pq_centroid,queries.size());
-	warp_independent_search_kernel<<<queries.size()/N_MULTIQUERY,N_THREAD_IN_BLOCK,sizeof(pq_value_t)  * pq_dim * 256>>>(d_data,d_query,d_result,d_graph,d_pq_centroid,d_pq_table,queries.size());
+	warp_independent_search_kernel<<<queries.size()/N_MULTIQUERY,N_THREAD_IN_BLOCK>>>\
+	(d_data,d_query,d_result,d_graph,d_pq_centroid,d_pq_table,d_datadist_list,d_hashdata,queries.size());
 
 	cudaDeviceSynchronize();
 
@@ -372,6 +379,9 @@ static void astar_multi_start_search_batch(const std::vector<std::vector<std::pa
 	cudaFree(d_result);
 	cudaFree(d_graph);
 	cudaFree(d_pq_centroid);
+	cudaFree(d_pq_table);
+	cudaFree(d_hashdata);
+	cudaFree(d_datadist_list);
 }
 
 
