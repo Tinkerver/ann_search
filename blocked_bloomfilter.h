@@ -8,7 +8,9 @@
 
 template<const int size64,const int shift,const int num_hash>
 struct BlockedBloomFilter{
-    BLOOMFILTER_DATA_T data[size64 * BLOOMFILTER_SIZE64MULT];
+    BLOOMFILTER_DATA_T* data;
+	//BLOOMFILTER_DATA_T* data = new BLOOMFILTER_DATA_T[size64 * BLOOMFILTER_SIZE64MULT];
+
     //const static int num_hash = 7;
 	
 	const uint64_t random_number[10 * 2] = {
@@ -22,7 +24,8 @@ struct BlockedBloomFilter{
         };
     
 	__device__
-	BlockedBloomFilter(){
+	BlockedBloomFilter(BLOOMFILTER_DATA_T* d_data){
+		data=d_data;
         for(int i = 0;i < size64;++i)
             data[i] = 0;
     }
